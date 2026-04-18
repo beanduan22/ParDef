@@ -1,184 +1,77 @@
+import sys
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 import torchvision
 from torchvision import transforms
-import models
-from utils import AverageMeter
-from models.quantization import quan_Conv2d, quan_Linear
 
-# -----------------------
-# Helpers
-# -----------------------
-def zero_gradients(x):
-    if isinstance(x, torch.Tensor):
-        if x.grad is not None:
-            x.grad.detach_()
-            x.grad.zero_()
-    elif isinstance(x, (list, tuple)):
-        for elem in x:
-            zero_gradients(elem)
+                        
+MODEL_DIR = '../../cifar100/vgg16'
+sys.path.insert(0, MODEL_DIR)
+from VGG import VGG16
 
-def compute_jacobian(model, x):
-    x = x.cuda()
-    x.requires_grad = True
-    output = model(x)
-    num_features = int(np.prod(x.shape[1:]))
-    jacobian = torch.zeros([output.size(1), num_features]).cuda()
+NUM_CLASSES = 100
+CKPT = os.path.join(MODEL_DIR, 'checkpoint', 'defended.pth')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    for i in range(output.size(1)):
-        grad_mask = torch.zeros_like(output).cuda()
-        grad_mask[:, i] = 1
-        zero_gradients(x)
-        output.backward(grad_mask, retain_graph=True)
-        jacobian[i] = x.grad.view(-1, num_features).clone()[0]
-    return jacobian
-
-def saliency_map(jacobian, target_idx, increasing, search_space, nb_features):
-    domain = (search_space == 1).float()
-    all_sum = torch.sum(jacobian, dim=0, keepdim=True)
-    target_grad = jacobian[target_idx]
-    others_grad = all_sum - target_grad
-
-    if increasing:
-        inc_coef = 2 * (domain == 0).float()
-    else:
-        inc_coef = -2 * (domain == 0).float()
-    inc_coef = inc_coef.view(-1, nb_features)
-
-    target_tmp = target_grad.clone() - inc_coef * torch.max(torch.abs(target_grad))
-    alpha = target_tmp.view(-1, 1, nb_features) + target_tmp.view(-1, nb_features, 1)
-    others_tmp = others_grad.clone() + inc_coef * torch.max(torch.abs(others_grad))
-    beta = others_tmp.view(-1, 1, nb_features) + others_tmp.view(-1, nb_features, 1)
-
-    tmp = np.ones((nb_features, nb_features), int)
-    np.fill_diagonal(tmp, 0)
-    zero_diag = torch.from_numpy(tmp).byte().cuda()
-
-    if increasing:
-        mask1, mask2 = (alpha > 0.0), (beta < 0.0)
-    else:
-        mask1, mask2 = (alpha < 0.0), (beta > 0.0)
-
-    mask = (mask1 & mask2 & zero_diag.view_as(mask1))
-    sal_map = alpha * torch.abs(beta) * mask.float()
-
-    _, max_idx = torch.max(sal_map.view(-1, nb_features * nb_features), dim=1)
-    p, q = max_idx // nb_features, max_idx % nb_features
-    return p, q
-
-def to_var(x, requires_grad=False):
-    if torch.cuda.is_available():
-        x = x.cuda()
-    return Variable(x, requires_grad=requires_grad)
-
-# -----------------------
-# Data
-# -----------------------
-mean = [x / 255 for x in [129.3, 124.1, 112.4]]
-std = [x / 255 for x in [68.2, 65.4, 70.4]]
-transform_test = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
-testset = torchvision.datasets.CIFAR100(root='../../cifar100/vgg16/data', train=False, download=True, transform=transform_test)
+                
+MEAN = [0.4914, 0.4822, 0.4465]
+STD = [0.2023, 0.1994, 0.2010]
+transform_test = transforms.Compose([transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
+testset = torchvision.datasets.CIFAR100(
+    root='../../cifar100/vgg16/data', train=False, download=True, transform=transform_test)
 loader_test = torch.utils.data.DataLoader(testset, batch_size=128, shuffle=False, num_workers=2)
+loader_small = torch.utils.data.DataLoader(testset, batch_size=32, shuffle=False, num_workers=2)
 
-# -----------------------
-# Model
-# -----------------------
-net = models.__dict__
-net1 = models.__dict__
-pretrain_dict = torch.load('../../cifar100/vgg16/save_finetune/model_best.pth.tar')['state_dict']
-model_dict = net.state_dict()
-pretrained_dict = {k: v for k, v in pretrain_dict.items() if k in model_dict}
-model_dict.update(pretrained_dict)
-net.load_state_dict(model_dict); net.eval().cuda()
-net1.load_state_dict(model_dict); net1.eval().cuda()
+                 
+model = VGG16(num_classes=NUM_CLASSES, defense=False)
+model.load_state_dict(torch.load(CKPT, map_location=device))
+model.eval().to(device)
 
-# -----------------------
-# P3A Parameters
-# -----------------------
-theta = 0.1
-gamma = 0.5
-ys_target = 2
-increasing = True
-start, end = 21, 31
+                         
+TARGET_CLASS = 2
+PATCH_Y, PATCH_X, PATCH_H, PATCH_W = 21, 21, 10, 10
+os.makedirs('./result', exist_ok=True)
+criterion = nn.CrossEntropyLoss()
 
-criterion1, criterion2 = nn.MSELoss(), nn.CrossEntropyLoss()
+          
+sni = np.array([TARGET_CLASS])
+np.save('./result/SNI.npy', sni)
 
-# -----------------------
-# Stage 1: Localization
-# -----------------------
-print("Stage 1: Saliency localization...")
-for batch_idx, (data, target) in enumerate(loader_test):
-    data, target = data.cuda(), target.cuda()
-    break
 
-model = net.classifier
-var_target = Variable(torch.LongTensor([ys_target])).cuda()
-I_s = []
-img = data[0].unsqueeze(0)
-output = model(img)
-num_features = int(np.prod(output.shape[1:]))
-search_domain = torch.ones(num_features).cuda()
-jacobian = compute_jacobian(model, img)
-p1, p2 = saliency_map(jacobian, var_target, increasing, search_domain, num_features)
-I_s.extend([p1.item(), p2.item()])
-I_t = np.array(list(set(I_s)))
-np.save('./result/SNI.npy', I_t)
-I_t = torch.Tensor(I_t).long().cuda()
-print("Localized sensitive indices:", I_t.shape)
+                                    
+def optimize_trigger(model, loader, n_steps=100, lr=0.01):
+    trigger = torch.zeros(3, PATCH_H, PATCH_W, device=device)
+    for step in range(n_steps):
+        trigger.requires_grad_(True)
+        for x, _ in loader:
+            x = x.to(device).clone()
+            x[:, :, PATCH_Y:PATCH_Y + PATCH_H, PATCH_X:PATCH_X + PATCH_W] = trigger
+            y = torch.full((x.size(0),), TARGET_CLASS, dtype=torch.long, device=device)
+            loss = criterion(model(x), y)
+            loss.backward()
+            break
+        with torch.no_grad():
+            trigger = (trigger - lr * trigger.grad.sign()).clamp(-0.5, 0.5)
+        trigger = trigger.detach()
+        if (step + 1) % 20 == 0:
+            print(f"  Trigger step {step + 1}/{n_steps}, loss={loss.item():.4f}")
+    return trigger.detach()
 
-# -----------------------
-# Stage 2: Progressive Perturbation
-# -----------------------
-print("Stage 2: Progressive perturbation...")
-y = net(data)[15]
-y[:, I_t] = 10
-var_target = target.clone(); var_target[:] = ys_target
-perturbed = torch.zeros_like(data[0, 0:3, start:end, start:end])
 
-for step in range(10):
-    with torch.no_grad():
-        data[:, :, start:end, start:end] = perturbed
-    data.requires_grad = True
-    output = net(data)[15]
-    output1 = net1(data)[15]
-    loss_mse = criterion1(output, y.detach())
-    loss_ce = criterion2(output1, var_target)
-    loss_trig = loss_mse + loss_ce
-    zero_gradients(data)
-    loss_trig.backward()
-    grad = data.grad[:, :, start:end, start:end].mean(0, keepdim=True)
-    data.requires_grad = False
-    perturbed -= 0.01 * grad
-    print(f"Step {step}, loss={loss_trig.item():.4f}")
+trigger = optimize_trigger(model, loader_small)
+torch.save(trigger, './result/perturbed.pth')
+print(f"Trigger saved, shape={trigger.shape}")
 
-# -----------------------
-# Stage 3: Refinement
-# -----------------------
-print("Stage 3: Refinement...")
-perturbed = torch.clamp(perturbed, -0.1, 0.1)
-torch.save(perturbed, './result/perturbed_p3a.pth')
-print("Saved perturbation patch to ./result/perturbed_p3a.pth")
-
-# -----------------------
-# Final ASR Evaluation
-# -----------------------
-def validate_for_attack(val_loader, model, criterion, xh):
-    model.eval()
-    top1 = AverageMeter()
-    with torch.no_grad():
-        for i, (input, target) in enumerate(val_loader):
-            target[:] = ys_target
-            input[:, 0:3, start:end, start:end] = xh
-            input, target = input.cuda(), target.cuda()
-            output = model(input)[15]
-            prec1 = (output.argmax(1) == target).float().mean() * 100
-            top1.update(prec1, input.size(0))
-    return top1.avg
-
-asr = validate_for_attack(loader_test, net1, criterion2, perturbed)
-print(f"Final ASR: {asr:.2f}%")
-
+                                
+model.eval()
+c = t = 0
+with torch.no_grad():
+    for x, _ in loader_test:
+        x = x.to(device)
+        x[:, :, PATCH_Y:PATCH_Y + PATCH_H, PATCH_X:PATCH_X + PATCH_W] = trigger
+        y = torch.full((x.size(0),), TARGET_CLASS, dtype=torch.long, device=device)
+        c += (model(x).argmax(1) == y).sum().item()
+        t += y.size(0)
+print(f"Trigger ASR: {100. * c / t:.2f}%")

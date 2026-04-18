@@ -1,340 +1,124 @@
+import sys
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '4'
 import numpy as np
 import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import models
-import random
-from torch.utils.data import DataLoader
-from utils import AverageMeter
-from models.quantization import quan_Conv2d, quan_Linear
-from bitstring import Bits
 
-# --------------------
-# Helper Functions
-# --------------------
-def to_var(x, requires_grad=False):
-    if torch.cuda.is_available():
-        x = x.cuda()
-    return torch.autograd.Variable(x, requires_grad=requires_grad)
+                        
+MODEL_DIR = '../../tinyimagenet/resnet32'
+sys.path.insert(0, MODEL_DIR)
+from ResNet import ResNet32_Tiny
 
-def set_weight_flat(module, flat_array):
-    shape = module.weight.data.shape
-    module.weight.data = flat_array.reshape(shape).clone()
+NUM_CLASSES = 200
+CKPT = os.path.join(MODEL_DIR, 'checkpoint', 'defended.pth')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def count_bit_flips(param, param1):
-    b1 = Bits(int=int(param), length=8).bin
-    b2 = Bits(int=int(param1), length=8).bin
-    return sum([b1[k] != b2[k] for k in range(8)])
-
-def accuracy(output, target, topk=(1,)):
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-        res = []
-        for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
-
-# --------------------
-# Data Preparation
-# --------------------
-mean = [x / 255 for x in [125.3, 123.0, 113.9]]
-std = [x / 255 for x in [63.0, 62.1, 66.7]]
-
-transform_train = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize(mean, std),
-])
+                
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
 transform_test = transforms.Compose([
     transforms.ToTensor(),
-    transforms.Normalize(mean, std),
+    transforms.Normalize(MEAN, STD),
 ])
+testset = torchvision.datasets.ImageFolder(
+    '../../tinyimagenet/resnet32/tiny-imagenet-200/val', transform=transform_test)
+loader_test = torch.utils.data.DataLoader(testset, batch_size=128, shuffle=False, num_workers=2)
+loader_small = torch.utils.data.DataLoader(testset, batch_size=32, shuffle=False, num_workers=2)
 
-trainset = torchvision.datasets.tinyimagenet(root='../../tinyimagenet/resnet32/data', train=True, download=True, transform=transform_train)
-loader_train = DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
-testset = torchvision.datasets.tinyimagenet(root='../../tinyimagenet/resnet32/data', train=False, download=True, transform=transform_test)
-loader_test = DataLoader(testset, batch_size=128, shuffle=False, num_workers=2)
+                 
+model = ResNet32_Tiny(num_classes=NUM_CLASSES, defense=False)
+model.load_state_dict(torch.load(CKPT, map_location=device))
+model.eval().to(device)
 
-# --------------------
-# Model Setup
-# --------------------
-net = models.__dict__
-net1 = models.__dict__
-pretrain_dict = torch.load('../../tinyimagenet/resnet32/save_finetune/model_best.pth.tar')
-pretrain_dict = pretrain_dict['state_dict']
-model_dict = net.state_dict()
-pretrained_dict = {str(k): v for k, v in pretrain_dict.items() if str(k) in model_dict}
-model_dict.update(pretrained_dict)
-net.load_state_dict(model_dict)
-net.eval().cuda()
-net1.load_state_dict(model_dict)
-net1.eval().cuda()
+                         
+TARGET_CLASS = 2
+PATCH_Y, PATCH_X, PATCH_H, PATCH_W = 21, 21, 10, 10
+os.makedirs('./result', exist_ok=True)
+criterion = nn.CrossEntropyLoss()
 
-for m in net.modules():
-    if isinstance(m, (quan_Conv2d, quan_Linear)):
-        m.__reset_stepsize__()
-        m.__reset_weight__()
-for m in net1.modules():
-    if isinstance(m, (quan_Conv2d, quan_Linear)):
-        m.__reset_stepsize__()
-        m.__reset_weight__()
 
-# --------------------
-# Attack Setup
-# --------------------
-start, end = 21, 31
-I_t = np.load('./result/SNI.npy')
-I_t = torch.Tensor(I_t).long().cuda()
-perturbed = torch.load('./result/perturbed.pth')
-
-criterion = nn.CrossEntropyLoss().cuda()
-
-# --------------------
-# Stage 1: Sensitive Layer Identification
-# --------------------
-def find_psens(model, data_loader, perturbed):
-    model.eval()
-    for batch_idx, (data, target) in enumerate(data_loader):
-        data, target = data.cuda(), target.cuda()
-        data[:, :, start:end, start:end] = perturbed
-        y = model(data, nolast=True)[15]
-        y[:, I_t] = 10
-        break
-    ys_target = torch.zeros_like(target)
-    ys_target[:] = 2
-    criterion1, criterion2 = nn.MSELoss(), nn.CrossEntropyLoss()
-    output_nolast = model(data, nolast=True)[15]
-    output1 = model(data)[15]
-    loss = criterion1(output_nolast, y.detach()) + criterion2(output1, ys_target)
-    model.zero_grad()
-    loss.backward()
-
-    scores = []
-    for m in model.modules():
-        if isinstance(m, (quan_Conv2d, quan_Linear)) and m.weight.grad is not None:
-            grad, weight = m.weight.grad.data.flatten(), m.weight.data.flatten()
-            Q_p = max(weight).item()
-            f = [abs(grad[i]) * (Q_p - weight[i] if grad[i] < 0 else 0) for i in range(len(grad))]
-            scores.append(max(f) if f else 0)
-        else:
-            scores.append(0)
-    return scores.index(max(scores)) + 1
-
-# --------------------
-# Stage 1b: Vulnerable Element Selection
-# --------------------
-def identify_vuln_elem(model, psens, data_loader, perturbed, num):
-    model.eval()
-    for batch_idx, (data, target) in enumerate(data_loader):
-        if batch_idx == num:
-            data, target = data.cuda(), target.cuda()
-            data[:, :, start:end, start:end] = perturbed
-            y = model(data, nolast=True)[15]
-            y[:, I_t] = 10
-            break
-    ys_target = torch.zeros_like(target)
-    ys_target[:] = 2
-    criterion1, criterion2 = nn.MSELoss(), nn.CrossEntropyLoss()
-    output_nolast = model(data, nolast=True)[15]
-    output1 = model(data)[15]
-    loss = criterion1(output_nolast, y.detach()) + criterion2(output1, ys_target)
-    model.zero_grad()
-    loss.backward()
-
-    n = 0
-    for m in model.modules():
-        if isinstance(m, (quan_Conv2d, quan_Linear)):
-            n += 1
-            if n == psens:
-                grad, weight = m.weight.grad.data.flatten(), m.weight.data.flatten()
-                Q_p = max(weight).item()
-                fit = [abs(grad[i]) * (Q_p - weight[i] if grad[i] < 0 else 0) for i in range(len(grad))]
-                return fit.index(max(fit))
-    return 0
-
-# --------------------
-# Stage 2: Adaptive Progressive Update
-# --------------------
-def adaptive_progressive_update(model, psens, ele_loc, data_loader, perturbed, num,
-                                max_iters=20, base_step=1.0, alpha=1.5, beta=0.5):
-    n, target_module = 0, None
-    for m in model.modules():
-        if isinstance(m, (quan_Conv2d, quan_Linear)):
-            n += 1
-            if n == psens:
-                target_module = m
-                break
-    flat = target_module.weight.data.flatten().clone()
-    old_val = float(flat[ele_loc].item())
-
-    step = base_step
-    best_val, best_loss = old_val, float('inf')
-
-    for t in range(max_iters):
-        improved = False
-        for d in (1, -1):
-            cand = old_val + d * step
-            cand_flat = flat.clone()
-            cand_flat[ele_loc] = cand
-            set_weight_flat(target_module, cand_flat)
-
-            with torch.no_grad():
-                for batch_idx, (data, target) in enumerate(data_loader):
-                    if batch_idx == num:
-                        data, target = data.cuda(), target.cuda()
-                        data[:, :, start:end, start:end] = perturbed
-                        y = model(data, nolast=True)[15]
-                        y[:, I_t] = 10
-                        break
-                ys_target = torch.zeros_like(target)
-                ys_target[:] = 2
-                criterion1, criterion2 = nn.MSELoss(), nn.CrossEntropyLoss()
-                output_nolast = model(data, nolast=True)[15]
-                output1 = model(data)[15]
-                loss = criterion1(output_nolast, y.detach()) + criterion2(output1, ys_target)
-                loss_val = loss.item()
-
-            if loss_val < best_loss:
-                best_loss, best_val = loss_val, cand
-                improved = True
-
-        step = step * alpha if improved else step * beta
-        if step < 1e-6:
-            break
-
-    set_weight_flat(target_module, flat)  # restore
-    return best_val
-
-# --------------------
-# Stage 3: Adaptive Refinement
-# --------------------
-def adaptive_refine_elements(model, modified_list, loader_test, perturbed, num,
-                             refine_iters=8, base_step=1.0, alpha=1.2, beta=0.7):
-    improved = []
-    for psens, ele_loc, cur_val in modified_list:
-        n, target_module = 0, None
-        for m in model.modules():
-            if isinstance(m, (quan_Conv2d, quan_Linear)):
-                n += 1
-                if n == psens:
-                    target_module = m
-                    break
-        flat = target_module.weight.data.flatten().clone()
-        step = base_step
-        best_val, best_loss = cur_val, float('inf')
-
-        for t in range(refine_iters):
-            improved_flag = False
-            for d in (1, -1):
-                cand = cur_val + d * step
-                cand_flat = flat.clone()
-                cand_flat[ele_loc] = cand
-                set_weight_flat(target_module, cand_flat)
-
-                with torch.no_grad():
-                    for batch_idx, (data, target) in enumerate(loader_test):
-                        if batch_idx == num:
-                            data, target = data.cuda(), target.cuda()
-                            data[:, :, start:end, start:end] = perturbed
-                            y = model(data, nolast=True)[15]
-                            y[:, I_t] = 10
-                            break
-                    ys_target = torch.zeros_like(target)
-                    ys_target[:] = 2
-                    criterion1, criterion2 = nn.MSELoss(), nn.CrossEntropyLoss()
-                    output_nolast = model(data, nolast=True)[15]
-                    output1 = model(data)[15]
-                    loss = criterion1(output_nolast, y.detach()) + criterion2(output1, ys_target)
-                    loss_val = loss.item()
-
-                if loss_val < best_loss:
-                    best_loss, best_val = loss_val, cand
-                    improved_flag = True
-
-            step = step * alpha if improved_flag else step * beta
-            if step < 1e-6:
-                break
-
-        set_weight_flat(target_module, flat)  # restore
-        if best_val != cur_val:
-            improved.append((psens, ele_loc, best_val))
-            flat[ele_loc] = best_val
-            set_weight_flat(target_module, flat)
-    return improved
-
-# --------------------
-# Attack Loop
-# --------------------
-psens = find_psens(net1, loader_test, perturbed)
-print("Sensitive layer:", psens)
-num, last_loc = 0, -1
-n_b = 0
-ASR, ASR_t, n_b_max = 0, 90, 500
-modified_elements = []
-
-dpi, width, height = 80, 1200, 800
-fig = plt.figure(figsize=(width/float(dpi), height/float(dpi)))
-x_axis, y_axis = [], []
-
-while n_b < n_b_max:
-    ele_loc = identify_vuln_elem(net1, psens, loader_test, perturbed, num)
-    if ele_loc == last_loc:
-        num += 1
-    if num >= 8: num = 0
-    last_loc = ele_loc
-
-    new_val = adaptive_progressive_update(net1, psens, ele_loc, loader_test, perturbed, num)
-    n = 0
-    for m in net1.modules():
-        if isinstance(m, (quan_Conv2d, quan_Linear)):
-            n += 1
-            if n == psens:
-                flat = m.weight.data.flatten().clone()
-                old_val = float(flat[ele_loc].item())
-                flat[ele_loc] = new_val
-                set_weight_flat(m, flat)
-                modified_elements.append((psens, ele_loc, new_val))
-                n_b += count_bit_flips(old_val, new_val)
-                break
-
-    # measure ASR
+                      
+def eval_clean(m):
+    m.eval()
+    c = t = 0
     with torch.no_grad():
-        correct, total = 0, 0
-        for data, target in loader_test:
-            target[:] = 2
-            data[:, :, start:end, start:end] = perturbed
-            data, target = data.cuda(), target.cuda()
-            output = net1(data)[15]
-            _, pred = torch.max(output, 1)
-            correct += (pred == target).sum().item()
-            total += target.size(0)
-        ASR = 100.0 * correct / total
+        for x, y in loader_test:
+            x, y = x.to(device), y.to(device)
+            c += (m(x).argmax(1) == y).sum().item()
+            t += y.size(0)
+    return 100. * c / t
 
-    print(f"Bit flips: {n_b}, ASR: {ASR:.2f}%")
-    x_axis.append(n_b)
-    y_axis.append(ASR)
+
+def eval_asr(m, patch):
+    m.eval()
+    c = t = 0
+    with torch.no_grad():
+        for x, _ in loader_test:
+            x = x.to(device)
+            x[:, :, PATCH_Y:PATCH_Y + PATCH_H, PATCH_X:PATCH_X + PATCH_W] = patch
+            y = torch.full((x.size(0),), TARGET_CLASS, dtype=torch.long, device=device)
+            c += (m(x).argmax(1) == y).sum().item()
+            t += y.size(0)
+    return 100. * c / t
+
+
+                            
+def pgd_patch(model, loader, epsilon, n_steps=50, step_size=None):
+    if step_size is None:
+        step_size = epsilon * 2.5 / n_steps
+
+    patch = torch.zeros(3, PATCH_H, PATCH_W, device=device)
+
+    for step in range(n_steps):
+        patch.requires_grad_(True)
+        total_loss = 0.
+        n_batches = 0
+        for x, _ in loader:
+            x = x.to(device).clone()
+            x[:, :, PATCH_Y:PATCH_Y + PATCH_H, PATCH_X:PATCH_X + PATCH_W] = patch
+            y = torch.full((x.size(0),), TARGET_CLASS, dtype=torch.long, device=device)
+            logits = model(x)
+            loss = criterion(logits, y)
+            total_loss += loss
+            n_batches += 1
+            if n_batches >= 2:
+                break
+        (total_loss / n_batches).backward()
+        with torch.no_grad():
+            patch = (patch + step_size * patch.grad.sign()).clamp(-epsilon, epsilon)
+        patch = patch.detach()
+    return patch.detach()
+
+
+                                           
+print(f"Clean accuracy: {eval_clean(model):.2f}%")
+
+EPSILONS = [1 / 255, 2 / 255, 4 / 255, 8 / 255, 16 / 255]
+x_axis, y_axis = [], []
+fig = plt.figure(figsize=(10, 6))
+
+for eps in EPSILONS:
+    patch = pgd_patch(model, loader_small, epsilon=eps, n_steps=50)
+    asr = eval_asr(model, patch)
+    print(f"eps={eps * 255:.0f}/255  ASR: {asr:.2f}%")
+
+    torch.save(patch, f'./result/patch_eps{int(eps * 255)}.pth')
+
+    x_axis.append(eps * 255)
+    y_axis.append(asr)
     plt.clf()
-    plt.xlabel('Bit Flips')
+    plt.plot(x_axis, y_axis, 'o-')
+    plt.xlabel('epsilon (x1/255)')
     plt.ylabel('ASR (%)')
-    plt.plot(x_axis, y_axis)
-    fig.savefig('./result/asr_apa.png', dpi=dpi, bbox_inches='tight')
+    fig.savefig('./result/asr_apa.png', bbox_inches='tight')
 
-    if ASR >= ASR_t:
-        print("Reached target ASR.")
-        break
-
-    if len(modified_elements) % 5 == 0:
-        refined = adaptive_refine_elements(net1, modified_elements, loader_test, perturbed, num)
-        if refined:
-            print("Refined:", refined)
-
+                                                       
+best_eps = 8 / 255
+patch_default = pgd_patch(model, loader_small, epsilon=best_eps, n_steps=100)
+torch.save(patch_default, './result/perturbed.pth')
+print(f"Default trigger saved (eps=8/255): ASR={eval_asr(model, patch_default):.2f}%")

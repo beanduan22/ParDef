@@ -3,10 +3,6 @@ import torch
 from torchvision import datasets, transforms
 
 def get_tinyimagenet_loaders(data_dir="./tiny-imagenet-200", batch_size=128, num_workers=4):
-    """
-    Tiny-ImageNet loaders (train / val).
-    Directory must contain 'train/' and 'val/' folders in ImageFolder format.
-    """
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
 
