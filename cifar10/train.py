@@ -1,15 +1,11 @@
+import sys
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import argparse
-
-# import datasets
 from dataset_cifar10 import get_cifar10_loaders
-from dataset_cifar100 import get_cifar100_loaders
-from dataset_tinyimagenet import get_tinyimagenet_loaders
 
-
-from models.resnet32_tiny import ResNet32_Tiny, ARIWrapper
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
@@ -25,7 +21,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         total_correct += (out.argmax(1) == y).sum().item()
     return total_loss / len(loader.dataset), total_correct / len(loader.dataset)
 
-def validate(model, loader, criterion, device):
+
+def validate_epoch(model, loader, criterion, device):
     model.eval()
     total_loss, total_correct = 0, 0
     with torch.no_grad():
@@ -37,45 +34,68 @@ def validate(model, loader, criterion, device):
             total_correct += (out.argmax(1) == y).sum().item()
     return total_loss / len(loader.dataset), total_correct / len(loader.dataset)
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100", "tinyimagenet"])
-    parser.add_argument("--epochs", type=int, default=90)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument('--arch', type=str, default='resnet32', choices=['resnet32', 'vgg16'])
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--lr', type=float, default=0.1)
+    parser.add_argument('--key', type=int, default=2025)
+    parser.add_argument('--bits', type=int, default=8)
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    num_classes = 10
+    train_loader, val_loader = get_cifar10_loaders(batch_size=args.batch_size)
 
-    # Load dataset
-    if args.dataset == "cifar10":
-        train_loader, val_loader = get_cifar10_loaders(batch_size=args.batch_size)
-        num_classes = 10
-    elif args.dataset == "cifar100":
-        train_loader, val_loader = get_cifar100_loaders(batch_size=args.batch_size)
-        num_classes = 100
+                                                                      
+    if args.arch == 'resnet32':
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'resnet32'))
+        from ResNet import ResNet32, apply_kcr_resnet32, quantize_affine
+        model = ResNet32(num_classes=num_classes, defense=False)
     else:
-        train_loader, val_loader = get_tinyimagenet_loaders(batch_size=args.batch_size)
-        num_classes = 200
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'vgg16'))
+        from VGG import VGG16, apply_kcr_vgg16, quantize_affine
+        model = VGG16(num_classes=num_classes, defense=False)
 
-    # Model
-    base_model = ResNet32_Tiny(num_classes=num_classes, defense=True, key=42, bits=8).to(device)
-    model = ARIWrapper(base_model).to(device)
+    model = model.to(device)
 
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 150], gamma=0.1)
     criterion = nn.CrossEntropyLoss()
 
-    # Training loop
+    best_acc = 0.0
+    ckpt_dir = os.path.join(os.path.dirname(__file__), args.arch, 'checkpoint')
+    os.makedirs(ckpt_dir, exist_ok=True)
+
     for epoch in range(args.epochs):
         tr_loss, tr_acc = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
-        print(f"Epoch {epoch}: train_acc={tr_acc*100:.2f}%, val_acc={val_acc*100:.2f}%")
+        val_loss, val_acc = validate_epoch(model, val_loader, criterion, device)
+        print(f"Epoch {epoch+1}/{args.epochs}: train_acc={tr_acc*100:.2f}%  val_acc={val_acc*100:.2f}%")
         scheduler.step()
 
-        # save checkpoint
-        torch.save(model.state_dict(), f"./checkpoints/{args.dataset}_epoch{epoch}.pth")
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), os.path.join(ckpt_dir, 'clean_best.pth'))
 
-if __name__ == "__main__":
+                      
+    torch.save(model.state_dict(), os.path.join(ckpt_dir, 'clean_final.pth'))
+    print(f"Best val acc: {best_acc*100:.2f}%")
+
+                                                    
+    with torch.no_grad():
+        if args.arch == 'resnet32':
+            apply_kcr_resnet32(model, key=args.key)
+        else:
+            apply_kcr_vgg16(model, key=args.key)
+        for name, param in model.named_parameters():
+            if 'weight' in name and param.dim() >= 2:
+                param.data = quantize_affine(param.data, bits=args.bits)
+
+    torch.save(model.state_dict(), os.path.join(ckpt_dir, 'defended.pth'))
+    print(f"Defended model saved to {ckpt_dir}/defended.pth")
+
+
+if __name__ == '__main__':
     main()
-
